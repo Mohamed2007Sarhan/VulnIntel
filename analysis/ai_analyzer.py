@@ -3,16 +3,16 @@ VulnIntel — AI Analyzer Module
 Uses NVIDIA LLM API for intelligent vulnerability analysis and recommendations.
 """
 
-import json
 import logging
-import requests
-from typing import Dict, Any, List, Optional
+import time
+from typing import Dict, Any, List
+from openai import OpenAI
 
 logger = logging.getLogger(__name__)
 
 NVIDIA_API_BASE = "https://integrate.api.nvidia.com/v1"
 NVIDIA_API_KEY = "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"
-NVIDIA_MODEL = "meta/llama-3.1-70b-instruct"
+NVIDIA_MODEL = "deepseek-ai/deepseek-v4-pro"
 
 
 class AIAnalyzer:
@@ -21,25 +21,18 @@ class AIAnalyzer:
     def __init__(self, api_key: str = "", model: str = ""):
         self.api_key = api_key or NVIDIA_API_KEY
         self.model = model or NVIDIA_MODEL
-        self.base_url = NVIDIA_API_BASE
-
-    def _call_llm(self, system_prompt: str, user_prompt: str, max_tokens: int = 16384) -> str:
-        """Call the NVIDIA LLM API with manual retries for 429 Rate Limits."""
-        import time
-        from openai import OpenAI, RateLimitError
-        
-        client = OpenAI(
-            base_url="https://integrate.api.nvidia.com/v1",
-            api_key=self.api_key,
-            timeout=60.0,
-            max_retries=1
+        self.client = OpenAI(
+            base_url=NVIDIA_API_BASE,
+            api_key=self.api_key
         )
 
+    def _call_llm(self, system_prompt: str, user_prompt: str, max_tokens: int = 16384) -> str:
+        """Call the NVIDIA LLM API with manual retries."""
         max_attempts = 3
         for attempt in range(max_attempts):
             try:
-                completion = client.chat.completions.create(
-                    model="deepseek-ai/deepseek-v4-pro",
+                completion = self.client.chat.completions.create(
+                    model=self.model,
                     messages=[
                         {"role": "system", "content": system_prompt},
                         {"role": "user", "content": user_prompt}
@@ -47,29 +40,34 @@ class AIAnalyzer:
                     temperature=1,
                     top_p=0.95,
                     max_tokens=max_tokens,
-                    extra_body={"chat_template_kwargs": {"thinking": False}},
-                    stream=True
+                    stream=False
                 )
 
-                full_content = ""
-                for chunk in completion:
-                    if getattr(chunk, "choices", None) and chunk.choices and chunk.choices[0].delta.content is not None:
-                        full_content += chunk.choices[0].delta.content
+                full_content = completion.choices[0].message.content or ""
 
+                # Clean up reasoning tags if present
                 if "<think>" in full_content and "</think>" in full_content:
                     full_content = full_content.split("</think>")[-1].strip()
-                    
+
                 return full_content
-            except RateLimitError as e:
-                logger.warning(f"AI API Rate Limited (429). Attempt {attempt + 1}/{max_attempts}. Sleeping...")
-                if attempt < max_attempts - 1:
-                    time.sleep(15 * (attempt + 1))  # Exponential backoff: 15s, 30s...
-                else:
-                    return f"[AI Error] Rate Limit Exceeded after 3 attempts: {str(e)}"
+
             except Exception as e:
-                logger.error(f"AI API call failed: {e}")
-                return f"[AI Error] {str(e)}"
-        
+                error_str = str(e)
+                logger.error(f"AI API call failed (attempt {attempt + 1}): {error_str}")
+
+                if "429" in error_str:
+                    if attempt < max_attempts - 1:
+                        sleep_time = 15 * (attempt + 1)
+                        logger.warning(f"Rate limited. Sleeping {sleep_time}s...")
+                        time.sleep(sleep_time)
+                        continue
+                    return "[AI Error] Rate Limit Exceeded after 3 attempts."
+
+                if attempt < max_attempts - 1:
+                    time.sleep(5)
+                else:
+                    return f"[AI Error] {error_str}"
+
         return "[AI Error] Unknown failure"
 
     def analyze_target(self, target_info: Dict[str, Any]) -> str:
@@ -138,7 +136,7 @@ Focus on defensive value — which vulnerabilities need detection rules and lab 
                 f"Desc: {(cve.get('description', '') or '')[:100]}"
             )
 
-        user_prompt = f"Prioritize these CVEs for defensive security research:\n\n" + "\n".join(cve_summaries)
+        user_prompt = "Prioritize these CVEs for defensive security research:\n\n" + "\n".join(cve_summaries)
         return self._call_llm(system_prompt, user_prompt, max_tokens=2000)
 
     def analyze_failed_exploit_search(self, cve_data: Dict[str, Any], queries: List[str]) -> str:
@@ -150,20 +148,17 @@ Focus on defensive value — which vulnerabilities need detection rules and lab 
         affected_products = cve_data.get("affected_products", [])
         affected_versions = cve_data.get("affected_versions", [])
 
-        system_prompt = """You are an elite vulnerability researcher.
-A search for public exploits for the given CVE has FAILED (no results found).
-Your task is to:
-1. Analyze the FULL CVE specifications and description to determine the likely vulnerability type (e.g., SQLi, RCE, XSS).
-2. Write an actual custom Proof of Concept (PoC) python script or bash command that attempts to exploit this vulnerability in a lab environment. Wrap the code in markdown blocks.
-3. Provide the exact bash commands needed to set up a vulnerable lab target (using Docker, apt, etc) and to execute the exploit you just wrote.
-4. Provide a safe lab testing strategy to verify if the target is vulnerable.
-
-Keep it highly technical. You MUST output actual bash commands and scripts that a security researcher can run immediately."""
+        system_prompt = """You are an elite vulnerability researcher helping with authorized lab research.
+When no public exploits exist for a CVE, analyze the description and provide:
+1. The likely vulnerability type and attack surface
+2. A theoretical PoC approach for lab testing
+3. Docker/VM setup commands to create a safe test environment
+4. Detection and remediation guidance"""
 
         user_prompt = f"""Exploit Search Failed for: {cve_id}
 Queries Attempted: {', '.join(queries)}
 
-CVE Details & Specifications:
+CVE Details:
 - CVSS Score: {cvss_score}
 - Severity: {severity}
 - Affected Products: {', '.join(affected_products) if affected_products else 'Unknown'}
@@ -172,15 +167,14 @@ CVE Details & Specifications:
 CVE Description:
 {description}
 
-No public exploits were found. Please generate a custom technical analysis, a theoretical python exploit script, and exact bash commands to test this specific vulnerability using all the detailed specifications provided above."""
+Provide a technical analysis and safe lab testing approach for this vulnerability."""
 
         return self._call_llm(system_prompt, user_prompt, max_tokens=3000)
 
     def is_available(self) -> bool:
         """Check if the AI API is reachable."""
         try:
-            headers = {"Authorization": f"Bearer {self.api_key}"}
-            resp = requests.get(f"{self.base_url}/models", headers=headers, timeout=10)
-            return resp.status_code == 200
+            self.client.models.list()
+            return True
         except Exception:
             return False
