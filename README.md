@@ -54,7 +54,7 @@ VulnIntel/
 
 1. **Clone the repository:**
    ```bash
-   git clone https://github.com/yourusername/VulnIntel.git
+   git clone https://github.com/Mohamed2007Sarhan/VulnIntel.git
    cd VulnIntel
    ```
 
