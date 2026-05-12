@@ -28,9 +28,25 @@ GITHUB_RATE_LIMIT = 60          # requests per hour (unauthenticated)
 GITHUB_RATE_LIMIT_AUTH = 5000   # requests per hour (authenticated)
 SPLOITUS_REQUEST_DELAY = 2.0    # seconds between requests
 
+# Minimum seconds between consecutive LLM API calls (reduces 429 / rate-limit blocks).
+# Override with env: AI_REQUEST_COOLDOWN_SECONDS=6
+AI_REQUEST_COOLDOWN_SECONDS = float(os.environ.get("AI_REQUEST_COOLDOWN_SECONDS", "4.0"))
+
+# ─── Groq OpenAI-compatible API ────────────────────────────────────────────
+GROQ_API_BASE = os.environ.get("GROQ_API_BASE", "https://api.groq.com/openai/v1")
+GROQ_MODEL = os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b")
+# On-demand tier often hits 413/TPM if prompt + max_tokens is too large — keep these conservative.
+GROQ_MAX_OUTPUT_TOKENS = int(os.environ.get("GROQ_MAX_OUTPUT_TOKENS", "3072"))
+GROQ_PROMPT_DESCRIPTION_MAX_CHARS = int(os.environ.get("GROQ_PROMPT_DESCRIPTION_MAX_CHARS", "2600"))
+GROQ_TPM_BACKOFF_SECONDS = float(os.environ.get("GROQ_TPM_BACKOFF_SECONDS", "35"))
+
 # ─── API Keys (loaded from env or settings) ──────────────────────────────────
 NVD_API_KEY = os.environ.get("NVD_API_KEY", "")
 GITHUB_PAT = os.environ.get("GITHUB_PAT", "")
+GROQ_API_KEY = os.environ.get(
+    "GROQ_API_KEY",
+    "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",
+)
 
 # ─── GUI Theme ───────────────────────────────────────────────────────────────
 APPEARANCE_MODE = "dark"

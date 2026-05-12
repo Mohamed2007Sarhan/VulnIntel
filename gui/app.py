@@ -7,6 +7,7 @@ Monitoring never stops until manually stopped.
 import threading
 import time
 import logging
+import requests
 import customtkinter as ctk
 
 from config import (COLORS, APPEARANCE_MODE, COLOR_THEME,
@@ -276,6 +277,86 @@ class VulnIntelApp(ctk.CTk):
         self._monitor_thread = threading.Thread(target=self._pipeline_loop, daemon=True)
         self._monitor_thread.start()
 
+    def _search_github_exploits(self, cve_id: str, query: str, limit: int = 5):
+        """Search GitHub for PoC/exploit code references."""
+        try:
+            api_url = "https://api.github.com/search/repositories"
+            q = f"{query} (exploit OR poc OR rce OR lpe)"
+            params = {
+                "q": q,
+                "sort": "updated",
+                "order": "desc",
+                "per_page": min(max(limit, 1), 10),
+            }
+            headers = {"Accept": "application/vnd.github+json"}
+            resp = requests.get(api_url, params=params, headers=headers, timeout=20)
+            if resp.status_code != 200:
+                return []
+
+            data = resp.json()
+            items = data.get("items", []) or []
+            results = []
+            for item in items[:limit]:
+                full_name = item.get("full_name", "")
+                html_url = item.get("html_url", "")
+                desc = item.get("description", "") or ""
+                title = f"{full_name} PoC"
+                if not html_url:
+                    continue
+                results.append({
+                    "cve_id": cve_id,
+                    "exploit_title": title,
+                    "exploit_source": "github",
+                    "exploit_url": html_url,
+                    "exploit_type": "unknown",
+                    "platform": "multi",
+                    "description": desc[:500],
+                    "safe_for_lab": False,
+                    "raw_content": f"{full_name} {desc}",
+                })
+            return results
+        except Exception as e:
+            logger.error(f"GitHub exploit search failed for {cve_id}/{query}: {e}")
+            return []
+
+    def _download_best_github_artifact(self, cve_id: str, exploit_url: str, output_dir: str):
+        """Download best-effort GitHub artifact (file or README) for selected result."""
+        try:
+            if "github.com" not in exploit_url:
+                return None
+
+            if "/blob/" in exploit_url:
+                raw_url = exploit_url.replace("github.com", "raw.githubusercontent.com").replace("/blob/", "/")
+                resp = requests.get(raw_url, timeout=20)
+                if resp.status_code == 200 and resp.text.strip():
+                    ext = ".txt"
+                    raw_name = raw_url.split("/")[-1]
+                    if "." in raw_name:
+                        ext = "." + raw_name.split(".")[-1]
+                    code_path = output_dir + f"/{cve_id}_best_exploit{ext}"
+                    with open(code_path, "w", encoding="utf-8") as f:
+                        f.write(resp.text)
+                    return code_path
+                return None
+
+            # Repo URL fallback: download README as initial artifact
+            repo_parts = exploit_url.rstrip("/").split("/")
+            if len(repo_parts) < 5:
+                return None
+            owner = repo_parts[-2]
+            repo = repo_parts[-1]
+            readme_api = f"https://api.github.com/repos/{owner}/{repo}/readme"
+            headers = {"Accept": "application/vnd.github.raw+json"}
+            resp = requests.get(readme_api, headers=headers, timeout=20)
+            if resp.status_code == 200 and resp.text.strip():
+                readme_path = output_dir + f"/{cve_id}_best_exploit_README.md"
+                with open(readme_path, "w", encoding="utf-8") as f:
+                    f.write(resp.text)
+                return readme_path
+        except Exception as e:
+            logger.error(f"Failed to download GitHub artifact for {cve_id}: {e}")
+        return None
+
     def _pipeline_loop(self):
         """Main autonomous pipeline loop — never stops unless toggled off."""
         from generators.sigma_generator import generate_sigma_rule
@@ -435,10 +516,33 @@ class VulnIntelApp(ctk.CTk):
                             sw_kw = known_sw[0]
                             search_queries.append(f"{sw_kw} exploit")
 
+                        # Let AI generate better search queries before scanning sources.
+                        if self.ai_analyzer:
+                            try:
+                                ai_queries_raw = self.ai_analyzer.generate_exploit_search_queries(cve)
+                                import json
+                                parsed_queries = None
+                                if "```json" in ai_queries_raw:
+                                    block = ai_queries_raw.split("```json")[1].split("```")[0].strip()
+                                    parsed_queries = json.loads(block)
+                                else:
+                                    start_idx = ai_queries_raw.find("{")
+                                    if start_idx != -1:
+                                        parsed_queries, _ = json.JSONDecoder().raw_decode(ai_queries_raw[start_idx:])
+
+                                if parsed_queries and isinstance(parsed_queries.get("queries"), list):
+                                    for q in parsed_queries["queries"][:8]:
+                                        q = str(q).strip()
+                                        if q and q not in search_queries:
+                                            search_queries.append(q)
+                            except Exception as e:
+                                logger.error(f"AI query generation failed for {cve_id}: {e}")
+
                         self._set_detail(f"Cycle #{cycle} — Exploits: {cve_id} ({len(search_queries)} queries)")
-                        self._log_to_ui(f"🔍 Searching Exploit-DB and Sploitus for {cve_id}...")
+                        self._log_to_ui(f"🔍 Searching Exploit-DB, Sploitus, and GitHub for {cve_id}...")
 
                         cve_exploits_found = 0
+                        exploit_candidates = []
                         from concurrent.futures import ThreadPoolExecutor, as_completed
 
                         def search_src(src, q):
@@ -462,25 +566,108 @@ class VulnIntelApp(ctk.CTk):
                                 for exp in exploits:
                                     if exp.get("exploit_url"):
                                         exp["cve_id"] = cve_id
-                                        
-                                        # Save public exploit reference to file
-                                        import os
-                                        from config import DATA_DIR
-                                        pub_dir = os.path.join(DATA_DIR, "public_exploits")
-                                        os.makedirs(pub_dir, exist_ok=True)
-                                        
-                                        safe_title = "".join(c for c in str(exp.get("exploit_title", "exploit")) if c.isalnum() or c in (' ', '-', '_')).strip().replace(" ", "_")[:50]
-                                        if not safe_title: safe_title = "exploit"
-                                        file_path = os.path.join(pub_dir, f"{cve_id}_{exp.get('exploit_source', 'public')}_{safe_title}.txt")
-                                        
-                                        content = f"CVE: {cve_id}\nSource: {exp.get('exploit_source')}\nURL: {exp.get('exploit_url')}\nTitle: {exp.get('exploit_title')}\n"
-                                        with open(file_path, "w", encoding="utf-8") as f:
-                                            f.write(content)
-                                            
-                                        exp["description"] = f"{exp.get('description', '')}\n📁 Saved reference to: {file_path}"
-                                        self.db.add_exploit(exp)
-                                        cve_exploits_found += 1
-                                        total_exploits += 1
+                                        exploit_candidates.append(exp)
+
+                        # GitHub candidate search
+                        for query in search_queries[:10]:
+                            github_results = self._search_github_exploits(cve_id, query, limit=3)
+                            for exp in github_results:
+                                exploit_candidates.append(exp)
+
+                        # Let AI choose the best exploit candidate when results mention this CVE.
+                        selected_exploit = None
+                        cve_mentions = []
+                        for item in exploit_candidates:
+                            blob = " ".join([
+                                str(item.get("exploit_title", "")),
+                                str(item.get("description", "")),
+                                str(item.get("exploit_url", "")),
+                                str(item.get("raw_content", "")),
+                            ]).upper()
+                            if cve_id.upper() in blob:
+                                cve_mentions.append(item)
+
+                        if cve_mentions:
+                            selected_exploit = cve_mentions[0]
+                            if self.ai_analyzer and len(cve_mentions) > 1:
+                                try:
+                                    ai_pick = self.ai_analyzer.choose_best_exploit_candidate(cve, cve_mentions)
+                                    import json
+                                    parsed_pick = None
+                                    if "```json" in ai_pick:
+                                        block = ai_pick.split("```json")[1].split("```")[0].strip()
+                                        parsed_pick = json.loads(block)
+                                    else:
+                                        start_idx = ai_pick.find("{")
+                                        if start_idx != -1:
+                                            parsed_pick, _ = json.JSONDecoder().raw_decode(ai_pick[start_idx:])
+                                    if parsed_pick:
+                                        selected_index = int(parsed_pick.get("selected_index", 1)) - 1
+                                        if 0 <= selected_index < len(cve_mentions):
+                                            selected_exploit = cve_mentions[selected_index]
+                                except Exception as e:
+                                    logger.error(f"AI exploit candidate selection failed for {cve_id}: {e}")
+                        elif exploit_candidates and self.ai_analyzer:
+                            # No explicit CVE string match; ask AI to pick the most relevant anyway.
+                            try:
+                                ai_pick = self.ai_analyzer.choose_best_exploit_candidate(cve, exploit_candidates)
+                                import json
+                                parsed_pick = None
+                                if "```json" in ai_pick:
+                                    block = ai_pick.split("```json")[1].split("```")[0].strip()
+                                    parsed_pick = json.loads(block)
+                                else:
+                                    start_idx = ai_pick.find("{")
+                                    if start_idx != -1:
+                                        parsed_pick, _ = json.JSONDecoder().raw_decode(ai_pick[start_idx:])
+                                if parsed_pick:
+                                    selected_index = int(parsed_pick.get("selected_index", 1)) - 1
+                                    if 0 <= selected_index < len(exploit_candidates):
+                                        selected_exploit = exploit_candidates[selected_index]
+                            except Exception as e:
+                                logger.error(f"AI fallback candidate selection failed for {cve_id}: {e}")
+
+                        if selected_exploit:
+                            import os
+                            from config import DATA_DIR
+                            pub_dir = os.path.join(DATA_DIR, "public_exploits")
+                            os.makedirs(pub_dir, exist_ok=True)
+
+                            safe_title = "".join(
+                                c for c in str(selected_exploit.get("exploit_title", "exploit"))
+                                if c.isalnum() or c in (" ", "-", "_")
+                            ).strip().replace(" ", "_")[:50]
+                            if not safe_title:
+                                safe_title = "exploit"
+
+                            file_path = os.path.join(
+                                pub_dir,
+                                f"{cve_id}_{selected_exploit.get('exploit_source', 'public')}_{safe_title}.txt"
+                            )
+                            content = (
+                                f"CVE: {cve_id}\n"
+                                f"Source: {selected_exploit.get('exploit_source')}\n"
+                                f"URL: {selected_exploit.get('exploit_url')}\n"
+                                f"Title: {selected_exploit.get('exploit_title')}\n"
+                            )
+                            with open(file_path, "w", encoding="utf-8") as f:
+                                f.write(content)
+
+                            # If best candidate is from GitHub, try to download an artifact automatically.
+                            exploit_url = str(selected_exploit.get("exploit_url", ""))
+                            if "github.com" in exploit_url:
+                                downloaded_path = self._download_best_github_artifact(cve_id, exploit_url, pub_dir.replace("\\", "/"))
+                                if downloaded_path:
+                                    content += f"Downloaded Best Exploit Artifact: {downloaded_path}\n"
+
+                            selected_exploit["description"] = (
+                                f"{selected_exploit.get('description', '')}\n"
+                                f"📁 Saved best reference to: {file_path}"
+                            )
+                            self.db.add_exploit(selected_exploit)
+                            cve_exploits_found = 1
+                            total_exploits += 1
+                            self._log_to_ui(f"✅ Selected best public exploit for {cve_id} and saved it")
                                         
                         if cve_exploits_found > 0:
                             self._log_to_ui(f"✅ Found {cve_exploits_found} public exploits for {cve_id} from sources!")
@@ -676,14 +863,9 @@ if __name__ == "__main__":
                             except Exception as e:
                                 logger.error(f"Failed to generate AI exploit for {cve_id}: {e}")
                                 
-                            # Adding a small delay to prevent rapid-firing AI requests and hitting rate limits
-                            import time
+                            # Small delay so Groq TPM / rate limits recover between CVEs
                             time.sleep(10)
-                            
-                            # Adding a small delay to prevent rapid-firing AI requests and hitting rate limits
-                            import time
-                            time.sleep(10)
-                            
+
                 except Exception as e:
                     logger.error(f"Pipeline exploit search error: {e}")
 
