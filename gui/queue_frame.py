@@ -95,6 +95,12 @@ class QueueFrame(ctk.CTkFrame):
         self.opt_yara.pack(side="left", padx=3)
         self.opt_yara.select()
 
+        self.opt_ioc = ctk.CTkCheckBox(add_inner, text="IOC", font=ctk.CTkFont(size=11),
+                                         text_color=COLORS["text_primary"],
+                                         fg_color="#f59e0b", hover_color="#fbbf24")
+        self.opt_ioc.pack(side="left", padx=3)
+        self.opt_ioc.select()
+
         self.opt_report = ctk.CTkCheckBox(add_inner, text="Report", font=ctk.CTkFont(size=11),
                                            text_color=COLORS["text_primary"],
                                            fg_color=COLORS["info"], hover_color="#38bdf8")
@@ -205,6 +211,8 @@ class QueueFrame(ctk.CTkFrame):
             actions.append("sigma")
         if self.opt_yara.get():
             actions.append("yara")
+        if self.opt_ioc.get():
+            actions.append("ioc")
         if self.opt_report.get():
             actions.append("report")
 
@@ -224,7 +232,7 @@ class QueueFrame(ctk.CTkFrame):
             if cve_id and not any(item["cve_id"] == cve_id for item in self.queue_items):
                 self.queue_items.append({
                     "cve_id": cve_id,
-                    "actions": ["exploits", "sigma", "yara"],
+                    "actions": ["exploits", "sigma", "yara", "ioc"],
                     "status": "pending",
                     "progress": "",
                 })
@@ -238,7 +246,7 @@ class QueueFrame(ctk.CTkFrame):
             if cve_id and not any(item["cve_id"] == cve_id for item in self.queue_items):
                 self.queue_items.append({
                     "cve_id": cve_id,
-                    "actions": ["fetch", "exploits", "sigma", "yara", "report"],
+                    "actions": ["fetch", "exploits", "sigma", "yara", "ioc", "report"],
                     "status": "pending",
                     "progress": "",
                 })
@@ -291,9 +299,9 @@ class QueueFrame(ctk.CTkFrame):
                           text_color=COLORS["accent_primary"]).pack(side="left", padx=5)
 
             # Actions tags
-            for action in item.get("actions", [])[:4]:
+            for action in item.get("actions", [])[:5]:
                 tag_colors = {"fetch": COLORS["info"], "exploits": "#f59e0b",
-                               "sigma": "#6366f1", "yara": "#ec4899", "report": COLORS["accent_primary"]}
+                               "sigma": "#6366f1", "yara": "#ec4899", "ioc": "#f59e0b", "report": COLORS["accent_primary"]}
                 tag = ctk.CTkLabel(inner, text=action, font=ctk.CTkFont(size=9),
                                     text_color="#fff", fg_color=tag_colors.get(action, COLORS["text_muted"]),
                                     corner_radius=4, padx=4, pady=1)
@@ -422,6 +430,21 @@ class QueueFrame(ctk.CTkFrame):
                         self._log(f"  ✓ YARA rule generated")
                     except Exception as e:
                         self._log(f"  ✗ YARA error: {str(e)[:60]}")
+
+                # Step 4.5: IOC rule
+                if "ioc" in item["actions"]:
+                    item["progress"] = "Generating IOC..."
+                    self.after(0, self._update_queue_display)
+                    try:
+                        refs = self.db.get_references(cve_id)
+                        exploits = self.db.get_exploits_for_cve(cve_id)
+                        ioc = generate_ioc_summary(cve, refs, exploits)
+                        text = format_ioc_text(ioc)
+                        self.db.add_detection({"cve_id": cve_id, "detection_type": "ioc",
+                                                "rule_name": f"IOC_{cve_id}", "rule_content": text})
+                        self._log(f"  ✓ IOC rule generated")
+                    except Exception as e:
+                        self._log(f"  ✗ IOC error: {str(e)[:60]}")
 
                 # Step 5: Report
                 if "report" in item["actions"]:

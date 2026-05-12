@@ -57,14 +57,14 @@ class AIAnalyzer:
 
                 if "429" in error_str:
                     if attempt < max_attempts - 1:
-                        sleep_time = 15 * (attempt + 1)
+                        sleep_time = 45 * (attempt + 1)
                         logger.warning(f"Rate limited. Sleeping {sleep_time}s...")
                         time.sleep(sleep_time)
                         continue
                     return "[AI Error] Rate Limit Exceeded after 3 attempts."
 
                 if attempt < max_attempts - 1:
-                    time.sleep(5)
+                    time.sleep(10)
                 else:
                     return f"[AI Error] {error_str}"
 
@@ -153,7 +153,16 @@ When no public exploits exist for a CVE, analyze the description and provide:
 1. The likely vulnerability type and attack surface
 2. A theoretical PoC approach for lab testing
 3. Docker/VM setup commands to create a safe test environment
-4. Detection and remediation guidance"""
+4. Detection and remediation guidance
+
+FORMAT INSTRUCTIONS:
+Return the result as a raw JSON object (do not wrap it in markdown block quotes like ```json) with the following structure:
+{
+  "poc_script_filename": "exploit.py",  // Determine the best extension based on the exploit logic (e.g., .py, .php, .js)
+  "poc_script_content": "import requests\n...", // The actual PoC code
+  "docker_compose_content": "version: '3'\n...", // (Optional) Docker Compose file content for lab testing. Leave empty string if none.
+  "analysis_markdown": "# Technical Analysis\n..." // The rest of your analysis, explanation, and detection guidance in Markdown format.
+}"""
 
         user_prompt = f"""Exploit Search Failed for: {cve_id}
 Queries Attempted: {', '.join(queries)}
@@ -167,9 +176,9 @@ CVE Details:
 CVE Description:
 {description}
 
-Provide a technical analysis and safe lab testing approach for this vulnerability."""
+Provide a technical analysis and safe lab testing approach for this vulnerability. Ensure your output is purely the JSON format requested, without any surrounding markdown blocks."""
 
-        return self._call_llm(system_prompt, user_prompt, max_tokens=3000)
+        return self._call_llm(system_prompt, user_prompt, max_tokens=8192)
 
     def is_available(self) -> bool:
         """Check if the AI API is reachable."""

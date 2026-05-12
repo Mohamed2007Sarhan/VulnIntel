@@ -315,6 +315,79 @@ class VulnIntelApp(ctk.CTk):
                     logger.error(f"Pipeline sync error ({src_name}): {e}")
 
             if self._monitoring:
+                # ── Phase 2: Auto-generate detections for ALL new CVEs ───────────
+                self._update_monitor("syncing", "Pipeline: DETECTIONS", f"Cycle #{cycle} — Generating rules...")
+                try:
+                    from generators.sigma_generator import generate_sigma_rule
+                    from generators.yara_generator import generate_yara_rule
+                    from generators.ioc_generator import generate_ioc_summary, format_ioc_text
+                    import os
+                    from config import DATA_DIR
+                    det_dir = os.path.join(DATA_DIR, "detections")
+                    os.makedirs(det_dir, exist_ok=True)
+                    
+                    all_cves = self.db.get_all_cves(limit=10000)
+                    for cve in all_cves:
+                        if not self._monitoring:
+                            break
+                        cve_id = cve.get("cve_id", "")
+                        if not cve_id:
+                            continue
+
+                        existing = self.db.get_detections_for_cve(cve_id)
+                        existing_types = [d.get("detection_type", "") for d in existing]
+
+                        # Skip if we already have all 3
+                        if "sigma" in existing_types and "yara" in existing_types and "ioc" in existing_types:
+                            continue
+
+                        rules_generated = 0
+
+                        if "sigma" not in existing_types:
+                            try:
+                                sigma = generate_sigma_rule(cve)
+                                sigma_path = os.path.join(det_dir, f"{cve_id}_sigma.yml")
+                                with open(sigma_path, "w", encoding="utf-8") as f:
+                                    f.write(sigma)
+                                self.db.add_detection({"cve_id": cve_id, "detection_type": "sigma",
+                                                        "rule_name": f"Sigma_{cve_id}", "rule_content": f"Saved to: {sigma_path}\n\n{sigma}"})
+                                rules_generated += 1
+                            except Exception as e:
+                                logger.error(f"Sigma error for {cve_id}: {e}")
+
+                        if "yara" not in existing_types:
+                            try:
+                                yara = generate_yara_rule(cve)
+                                yara_path = os.path.join(det_dir, f"{cve_id}_yara.yar")
+                                with open(yara_path, "w", encoding="utf-8") as f:
+                                    f.write(yara)
+                                self.db.add_detection({"cve_id": cve_id, "detection_type": "yara",
+                                                        "rule_name": f"YARA_{cve_id}", "rule_content": f"Saved to: {yara_path}\n\n{yara}"})
+                                rules_generated += 1
+                            except Exception as e:
+                                logger.error(f"Yara error for {cve_id}: {e}")
+
+                        if "ioc" not in existing_types:
+                            try:
+                                refs = self.db.get_references(cve_id)
+                                exploits = self.db.get_exploits_for_cve(cve_id)
+                                ioc = generate_ioc_summary(cve, refs, exploits)
+                                text = format_ioc_text(ioc)
+                                ioc_path = os.path.join(det_dir, f"{cve_id}_ioc.txt")
+                                with open(ioc_path, "w", encoding="utf-8") as f:
+                                    f.write(text)
+                                self.db.add_detection({"cve_id": cve_id, "detection_type": "ioc",
+                                                        "rule_name": f"IOC_{cve_id}", "rule_content": f"Saved to: {ioc_path}\n\n{text}"})
+                                rules_generated += 1
+                            except Exception as e:
+                                logger.error(f"IOC error for {cve_id}: {e}")
+                                
+                        if rules_generated > 0:
+                            self._log_to_ui(f"🛡️ Generated {rules_generated} detection rules (Sigma/Yara/IOC) for {cve_id}")
+                except Exception as e:
+                    logger.error(f"Pipeline detection gen error: {e}")
+
+                # ── Phase 3: AI Exploit Generation (Heavy) ───────────
                 self._update_monitor("syncing", "Pipeline: EXPLOITS", f"Cycle #{cycle} — Searching exploits...")
                 try:
                     import re as _re
@@ -419,93 +492,101 @@ class VulnIntelApp(ctk.CTk):
                             try:
                                 ai_analysis = self.ai_analyzer.analyze_failed_exploit_search(cve, search_queries)
                                 if ai_analysis and not ai_analysis.startswith("[AI Error]"):
-                                    # Write to physical file
+                                    # Parse AI JSON response
                                     import os
+                                    import json
                                     from config import DATA_DIR
-                                    ai_dir = os.path.join(DATA_DIR, "ai_exploits")
-                                    os.makedirs(ai_dir, exist_ok=True)
-                                    file_path = os.path.join(ai_dir, f"{cve_id}_poc.txt")
-                                    with open(file_path, "w", encoding="utf-8") as f:
-                                        f.write(ai_analysis)
+                                    ai_dir_base = os.path.join(DATA_DIR, "ai_exploits")
+                                    os.makedirs(ai_dir_base, exist_ok=True)
+                                    
+                                    # Create a specific folder for this CVE
+                                    cve_folder = os.path.join(ai_dir_base, cve_id)
+                                    os.makedirs(cve_folder, exist_ok=True)
+                                    
+                                    try:
+                                        # Ultra-robust JSON extraction
+                                        import json
+                                        parsed_data = None
+                                        
+                                        # Attempt 1: Extract from markdown block
+                                        if "```json" in ai_analysis:
+                                            block = ai_analysis.split("```json")[1].split("```")[0].strip()
+                                            try:
+                                                parsed_data = json.loads(block)
+                                            except Exception:
+                                                pass
+                                                
+                                        # Attempt 2: Use raw_decode to parse the first JSON object and ignore surrounding text
+                                        if parsed_data is None:
+                                            start_idx = ai_analysis.find('{')
+                                            if start_idx != -1:
+                                                try:
+                                                    parsed_data, _ = json.JSONDecoder().raw_decode(ai_analysis[start_idx:])
+                                                except Exception:
+                                                    pass
+                                                    
+                                        if parsed_data is None:
+                                            raise json.JSONDecodeError("Could not extract valid JSON from AI response", ai_analysis, 0)
+                                            
+                                        # Save Markdown Analysis
+                                        analysis_path = os.path.join(cve_folder, "analysis.md")
+                                        with open(analysis_path, "w", encoding="utf-8") as f:
+                                            f.write(parsed_data.get("analysis_markdown", "No analysis provided."))
+                                            
+                                        # Save PoC Script
+                                        script_name = parsed_data.get("poc_script_filename", "exploit.txt")
+                                        script_content = parsed_data.get("poc_script_content", "")
+                                        if script_content:
+                                            script_path = os.path.join(cve_folder, script_name)
+                                            with open(script_path, "w", encoding="utf-8") as f:
+                                                f.write(script_content)
+                                                
+                                        # Save Docker Compose if exists
+                                        docker_content = parsed_data.get("docker_compose_content", "")
+                                        if docker_content:
+                                            docker_path = os.path.join(cve_folder, "docker-compose.yml")
+                                            with open(docker_path, "w", encoding="utf-8") as f:
+                                                f.write(docker_content)
 
-                                    self.db.add_exploit({
-                                        "cve_id": cve_id,
-                                        "exploit_title": f"AI Generated Theoretical Approach for {cve_id}",
-                                        "exploit_source": "ai_generated",
-                                        "exploit_url": f"file:///{file_path.replace(chr(92), '/')}",
-                                        "exploit_type": "theoretical",
-                                        "platform": "multi",
-                                        "description": f"AI-generated theoretical exploit. Saved to: {file_path}",
-                                        "safe_for_lab": True,
-                                        "raw_content": ai_analysis
-                                    })
-                                    total_exploits += 1
-                                    self._log_to_ui(f"✅ AI successfully generated an exploit approach for {cve_id}")
-                                    self._log_to_ui(f"   📁 Saved to: {file_path}")
+                                        self.db.add_exploit({
+                                            "cve_id": cve_id,
+                                            "exploit_title": f"AI Generated Theoretical Approach for {cve_id}",
+                                            "exploit_source": "ai_generated",
+                                            "exploit_url": f"file:///{cve_folder.replace(chr(92), '/')}",
+                                            "exploit_type": "theoretical",
+                                            "platform": "multi",
+                                            "description": f"AI-generated theoretical exploit. Saved to folder: {cve_folder}",
+                                            "safe_for_lab": True,
+                                            "raw_content": parsed_data.get("analysis_markdown", "Generated analysis.")
+                                        })
+                                        total_exploits += 1
+                                        self._log_to_ui(f"✅ AI successfully generated an exploit approach for {cve_id}")
+                                        self._log_to_ui(f"   📁 Saved to folder: {cve_folder}")
+                                        
+                                    except json.JSONDecodeError as e:
+                                        logger.error(f"Failed to parse AI JSON for {cve_id}: {e}")
+                                        # Fallback: Save the raw text if parsing fails
+                                        fallback_path = os.path.join(cve_folder, "raw_output.txt")
+                                        with open(fallback_path, "w", encoding="utf-8") as f:
+                                            f.write(ai_analysis)
+                                        self._log_to_ui(f"⚠️ AI JSON parsing failed for {cve_id}. Saved raw output to: {fallback_path}")
                                 else:
                                     self._log_to_ui(f"⚠️ AI failed to generate exploit approach for {cve_id}")
                             except Exception as e:
                                 logger.error(f"Failed to generate AI exploit for {cve_id}: {e}")
+                                
+                            # Adding a small delay to prevent rapid-firing AI requests and hitting rate limits
+                            import time
+                            time.sleep(10)
+                            
+                            # Adding a small delay to prevent rapid-firing AI requests and hitting rate limits
+                            import time
+                            time.sleep(10)
+                            
                 except Exception as e:
                     logger.error(f"Pipeline exploit search error: {e}")
 
-            # ── Phase 3: Auto-generate detections for new CVEs ───────────
-            if self._monitoring:
-                self._update_monitor("syncing", "Pipeline: DETECTIONS", f"Cycle #{cycle} — Generating rules...")
-                try:
-                    from generators.sigma_generator import generate_sigma_rule
-                    from generators.yara_generator import generate_yara_rule
-                    
-                    all_cves = self.db.get_all_cves(limit=10000)
-                    for cve in all_cves:
-                        if not self._monitoring:
-                            return
-                        cve_id = cve.get("cve_id", "")
-                        if not cve_id:
-                            continue
-
-                        # Check if already has detections
-                        existing = self.db.get_detections_for_cve(cve_id)
-                        if len(existing) >= 2:
-                            continue
-
-                        self._set_detail(f"Cycle #{cycle} — Rules: {cve_id}")
-                        rules_generated = 0
-
-                        # Ensure detections folder exists
-                        import os
-                        from config import DATA_DIR
-                        det_dir = os.path.join(DATA_DIR, "detections")
-                        os.makedirs(det_dir, exist_ok=True)
-
-                        try:
-                            sigma = generate_sigma_rule(cve)
-                            sigma_path = os.path.join(det_dir, f"{cve_id}_sigma.yml")
-                            with open(sigma_path, "w", encoding="utf-8") as f:
-                                f.write(sigma)
-                            
-                            self.db.add_detection({"cve_id": cve_id, "detection_type": "sigma",
-                                                    "rule_name": f"Sigma_{cve_id}", "rule_content": f"Saved to: {sigma_path}\n\n{sigma}"})
-                            rules_generated += 1
-                        except Exception as e:
-                            logger.error(f"Sigma error for {cve_id}: {e}")
-
-                        try:
-                            yara = generate_yara_rule(cve)
-                            yara_path = os.path.join(det_dir, f"{cve_id}_yara.yar")
-                            with open(yara_path, "w", encoding="utf-8") as f:
-                                f.write(yara)
-                                
-                            self.db.add_detection({"cve_id": cve_id, "detection_type": "yara",
-                                                    "rule_name": f"YARA_{cve_id}", "rule_content": f"Saved to: {yara_path}\n\n{yara}"})
-                            rules_generated += 1
-                        except Exception as e:
-                            logger.error(f"Yara error for {cve_id}: {e}")
-                            
-                        if rules_generated > 0:
-                            self._log_to_ui(f"🛡️ Generated {rules_generated} detection rules (Sigma/Yara) for {cve_id}")
-                except Exception as e:
-                    logger.error(f"Pipeline detection gen error: {e}")
+            # Phase 3 (Detections) has been merged into Phase 1 to generate rules immediately per CVE.
 
             # ── Cycle complete — refresh UI ──────────────────────────────
             err_text = f" ({len(errors)} errors)" if errors else ""
