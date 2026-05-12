@@ -502,6 +502,96 @@ class VulnIntelApp(ctk.CTk):
                                     # Create a specific folder for this CVE
                                     cve_folder = os.path.join(ai_dir_base, cve_id)
                                     os.makedirs(cve_folder, exist_ok=True)
+
+                                    def _build_default_detect_script(cve_record):
+                                        """Build a safe fallback detector script when AI does not provide one."""
+                                        cve_desc = str(cve_record.get("description", ""))
+                                        safe_desc = cve_desc.replace('"""', r'\"\"\"')
+                                        return f'''#!/usr/bin/env python3
+import argparse
+import re
+import socket
+from urllib.parse import urlparse
+
+CVE_ID = "{cve_id}"
+CVE_DESCRIPTION = """{safe_desc}"""
+TARGET_FIELDS = (
+    "service banner",
+    "application version",
+    "HTTP response headers/body",
+    "TLS certificate metadata",
+    "running process/service inventory",
+)
+
+def normalize_target(target):
+    value = (target or "").strip()
+    if not value:
+        return "", ""
+
+    if "://" in value:
+        parsed = urlparse(value)
+        host = parsed.hostname or value
+        return value, host
+
+    return value, value.split("/")[0].split(":")[0]
+
+def probe_dns(target_host):
+    try:
+        ip = socket.gethostbyname(target_host)
+        return f"[+] DNS resolved: {{target_host}} -> {{ip}}"
+    except Exception:
+        return f"[-] DNS resolution failed for {{target_host}} (target may be local/app-only)"
+
+def main():
+    parser = argparse.ArgumentParser(
+        description=f"Lab-safe heuristic detector for {{CVE_ID}}."
+    )
+    parser.add_argument(
+        "target",
+        help="Target identifier: IP, domain, URL, hostname, app name, MAC text, or any asset label",
+    )
+    parser.add_argument(
+        "--evidence",
+        default="",
+        help="Optional raw evidence text (banner/version/headers/log snippet) for matching affected indicators.",
+    )
+    args = parser.parse_args()
+
+    raw_target, host_for_lookup = normalize_target(args.target)
+    if not raw_target:
+        print("[-] Empty target value.")
+        return
+
+    print(f"[i] CVE check: {{CVE_ID}}")
+    print(f"[i] Target: {{raw_target}}")
+
+    if host_for_lookup:
+        print(probe_dns(host_for_lookup))
+
+    evidence = (args.evidence or "").lower()
+    desc = CVE_DESCRIPTION.lower()
+    indicators = sorted(set(re.findall(r"[a-z0-9][a-z0-9._-]{{2,}}", desc)))
+    indicators = [i for i in indicators if any(c.isalpha() for c in i)][:20]
+
+    matches = [i for i in indicators if i in evidence] if evidence else []
+    vulnerable = len(matches) > 0
+
+    if vulnerable:
+        print("[!] Likely VULNERABLE: indicators detected in provided evidence.")
+        print("[!] Potentially affected location(s):")
+        for field in TARGET_FIELDS:
+            print(f"   - {{field}}")
+        print(f"[!] Matched indicators: {{', '.join(matches)}}")
+    else:
+        print("[?] No direct indicator matched.")
+        print("[?] Unable to confirm vulnerability from current input.")
+        print("[?] Collect evidence from these locations and retry with --evidence:")
+        for field in TARGET_FIELDS:
+            print(f"   - {{field}}")
+
+if __name__ == "__main__":
+    main()
+'''
                                     
                                     try:
                                         # Ultra-robust JSON extraction
@@ -540,6 +630,17 @@ class VulnIntelApp(ctk.CTk):
                                             script_path = os.path.join(cve_folder, script_name)
                                             with open(script_path, "w", encoding="utf-8") as f:
                                                 f.write(script_content)
+
+                                        # Save detection script (always produce detect.py for each CVE folder)
+                                        detect_name = parsed_data.get("detect_script_filename", "detect.py")
+                                        if not str(detect_name).lower().endswith(".py"):
+                                            detect_name = "detect.py"
+                                        detect_content = parsed_data.get("detect_script_content", "")
+                                        if not detect_content:
+                                            detect_content = _build_default_detect_script(cve)
+                                        detect_path = os.path.join(cve_folder, detect_name)
+                                        with open(detect_path, "w", encoding="utf-8") as f:
+                                            f.write(detect_content)
                                                 
                                         # Save Docker Compose if exists
                                         docker_content = parsed_data.get("docker_compose_content", "")

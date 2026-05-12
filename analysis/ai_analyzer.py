@@ -160,6 +160,8 @@ Return the result as a raw JSON object (do not wrap it in markdown block quotes 
 {
   "poc_script_filename": "exploit.py",  // Determine the best extension based on the exploit logic (e.g., .py, .php, .js)
   "poc_script_content": "import requests\n...", // The actual PoC code
+  "detect_script_filename": "detect.py", // A Python detection script that checks a target (IP/domain/URL/host/app identifier/MAC text) for signs of this CVE.
+  "detect_script_content": "import socket\n...", // Script must accept a target argument and print whether the CVE appears present and where.
   "docker_compose_content": "version: '3'\n...", // (Optional) Docker Compose file content for lab testing. Leave empty string if none.
   "analysis_markdown": "# Technical Analysis\n..." // The rest of your analysis, explanation, and detection guidance in Markdown format.
 }"""
